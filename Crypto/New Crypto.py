@@ -7,23 +7,42 @@ from datetime import datetime
 from email.mime.text import MIMEText
 import pytz
 from collections import deque
+import os
+from pathlib import Path
+
+# Load environment variables from .env file
+# The .env file should be located at the repository root
+env_path = Path(__file__).parent.parent / '.env'
+if env_path.exists():
+    with open(env_path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            key, _, value = line.partition('=')
+            os.environ.setdefault(key, value)
+
 
 # CONFIGURATION
-BASE_URL = "https://api.alpaca.markets"
-API_KEY = "AK8XASA88WMTSRKFMRN3"
-API_SECRET = "96cnaUhRf4OaGM98QbDZJbCLCuWRmwAKEvreIzEu"
+BASE_URL = os.getenv("ALPACA_BASE_URL", "https://api.alpaca.markets")  # can override via env
+API_KEY = os.getenv("APCA_API_KEY_ID")
+API_SECRET = os.getenv("APCA_API_SECRET_KEY")
+if not API_KEY or not API_SECRET:
+    raise RuntimeError("Missing Alpaca API credentials: APCA_API_KEY_ID and APCA_API_SECRET_KEY must be set in .env")
 HEADERS = {
     "APCA-API-KEY-ID": API_KEY,
     "APCA-API-SECRET-KEY": API_SECRET,
     "Content-Type": "application/json"
 }
 
-# EMAIL
-EMAIL_HOST = "smtp.gmail.com"
-EMAIL_PORT = 587
-EMAIL_ADDRESS = "mktalley@gmail.com"
-EMAIL_PASSWORD = "eooncglziamrtcyw"
-TO_EMAIL = "mktalley@icloud.com"
+# EMAIL SETTINGS
+EMAIL_HOST = os.getenv("EMAIL_HOST", "smtp.gmail.com")
+EMAIL_PORT = int(os.getenv("EMAIL_PORT", 587))
+EMAIL_ADDRESS = os.getenv("EMAIL_ADDRESS")
+EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
+TO_EMAIL = os.getenv("TO_EMAIL")
+if not all([EMAIL_ADDRESS, EMAIL_PASSWORD, TO_EMAIL]):
+    raise RuntimeError("Missing email credentials: EMAIL_ADDRESS, EMAIL_PASSWORD, TO_EMAIL")
 
 # STRATEGY PARAMETERS
 TOP_N_SYMBOLS = 5   # select top N cryptos by 24h volume
