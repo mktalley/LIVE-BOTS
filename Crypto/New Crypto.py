@@ -110,11 +110,14 @@ def get_orderbook(sym):
 
 
 def get_daily_volume(sym):
+    # Alpaca data API expects symbols without slash, e.g., 'BTCUSD'
+    ticker = sym.replace("/", "")
     url = "https://data.alpaca.markets/v1beta2/crypto/us/bars"
-    params = {"symbols": sym, "timeframe": "1Day", "limit": 1}
+    params = {"symbols": ticker, "timeframe": "1Day", "limit": 1}
     r = requests.get(url, headers=HEADERS, params=params)
     r.raise_for_status()
-    bars = r.json().get("bars", {}).get(sym, [])
+    data = r.json().get("bars", {})
+    bars = data.get(ticker, [])
     return float(bars[0].get("v", 0.0)) if bars else 0.0
 
 
