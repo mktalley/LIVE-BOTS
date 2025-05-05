@@ -26,7 +26,28 @@ EMAIL_PASSWORD = "eooncglziamrtcyw"
 TO_EMAIL = "mktalley@icloud.com"
 
 # STRATEGY PARAMETERS
-SYMBOLS = ["BTC/USD", "ETH/USD", "SOL/USD", "LTC/USD", "AVAX/USD"]
+TOP_N_SYMBOLS = 5   # select top N cryptos by 24h volume
+
+# Dynamic symbol universe (top N by 24h volume)
+def fetch_top_symbols(n):
+    r = requests.get("https://data.alpaca.markets/v1beta2/crypto/us/tickers", headers=HEADERS)
+    r.raise_for_status()
+    tickers = r.json().get("tickers", [])
+    sorted_by_vol = sorted(tickers, key=lambda t: t.get("day", {}).get("v", 0), reverse=True)
+    syms = []
+    for t in sorted_by_vol[:n]:
+        s = t.get("symbol", "")
+        if s.endswith("USD"):
+            syms.append(f"{s[:-3]}/USD")
+        else:
+            syms.append(s)
+    return syms
+
+try:
+    SYMBOLS = fetch_top_symbols(TOP_N_SYMBOLS)
+except Exception:
+    # fallback to manual list if fetch fails
+    SYMBOLS = ["BTC/USD", "ETH/USD", "SOL/USD", "LTC/USD", "AVAX/USD"]
 SHORT_EMA_PERIOD = 15   # minutes
 LONG_EMA_PERIOD = 60    # minutes
 ATR_PERIOD = 14         # lookback for ATR calculation
