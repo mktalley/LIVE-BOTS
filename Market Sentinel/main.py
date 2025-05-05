@@ -1,44 +1,53 @@
-import os, json, time, logging, csv, pytz, smtplib, math
+import os, sys, json, time, logging, csv, pytz, smtplib, math
+from pathlib import Path
 from datetime import datetime, date, timedelta, time as dt_time
 from email.mime.text import MIMEText
 from alpaca_trade_api.rest import REST, TimeFrame, APIError
 
 # ─── CONFIG ─────────────────────────────────────────────────────────────────────
-API_KEY    = "AK8XASA88WMTSRKFMRN3"
-API_SECRET = "96cnaUhRf4OaGM98QbDZJbCLCuWRmwAKEvreIzEu"
-BASE_URL   = "https://api.alpaca.markets"
+# Load credentials and settings from environment
+API_KEY = os.getenv("APCA_API_KEY")
+API_SECRET = os.getenv("APCA_API_SECRET")
+BASE_URL = os.getenv("APCA_BASE_URL", "https://api.alpaca.markets")
 
-BOT_A_SYMBOLS_FILE = "botA_symbols.txt"
-BOT_B_SYMBOLS_FILE = "botB_symbols.txt"
-BASELINE_FILE      = "baselines.json"
-TRADE_LOG_FILE     = "trade_log.csv"
-LOG_FILE_PATH      = "sentinel.log"
-PRICE_HISTORY_FILE = "price_history.csv"
+# Directory for local files
+BASE_DIR = Path(__file__).parent
 
-BUY_TRIGGER_A      = 0.995
-SELL_TRIGGER_A     = 1.09
-STOP_MULTIPLIER_A  = 0.3
+# File paths (can override filenames via env vars; resolves relative to BASE_DIR)
+BOT_A_SYMBOLS_FILE = BASE_DIR / os.getenv("BOT_A_SYMBOLS_FILE", "botA_symbols.txt")
+BOT_B_SYMBOLS_FILE = BASE_DIR / os.getenv("BOT_B_SYMBOLS_FILE", "botB_symbols.txt")
+BASELINE_FILE = BASE_DIR / os.getenv("BASELINE_FILE", "baselines.json")
+TRADE_LOG_FILE = BASE_DIR / os.getenv("TRADE_LOG_FILE", "trade_log.csv")
+LOG_FILE_PATH = BASE_DIR / os.getenv("LOG_FILE_PATH", "sentinel.log")
+PRICE_HISTORY_FILE = BASE_DIR / os.getenv("PRICE_HISTORY_FILE", "price_history.csv")
 
-BUY_TRIGGER_B      = 0.98
-SELL_TRIGGER_B     = 1.03
-STOP_MULTIPLIER_B  = 0.5
+# Trading triggers
+BUY_TRIGGER_A = float(os.getenv("BUY_TRIGGER_A", 0.995))
+SELL_TRIGGER_A = float(os.getenv("SELL_TRIGGER_A", 1.09))
+STOP_MULTIPLIER_A = float(os.getenv("STOP_MULTIPLIER_A", 0.3))
+BUY_TRIGGER_B = float(os.getenv("BUY_TRIGGER_B", 0.98))
+SELL_TRIGGER_B = float(os.getenv("SELL_TRIGGER_B", 1.03))
+STOP_MULTIPLIER_B = float(os.getenv("STOP_MULTIPLIER_B", 0.5))
 
-ATR_PERIOD     = 14
-RISK_PCT       = 0.015
-RESET_HOURS    = 6
-BASELINE_DRIFT = 0.05
-VOLATILITY_FILTER = 0.02  # don’t reset baseline if volatility too low
+# Risk and baseline parameters
+ATR_PERIOD = int(os.getenv("ATR_PERIOD", 14))
+RISK_PCT = float(os.getenv("RISK_PCT", 0.015))
+RESET_HOURS = int(os.getenv("RESET_HOURS", 6))
+BASELINE_DRIFT = float(os.getenv("BASELINE_DRIFT", 0.05))
+VOLATILITY_FILTER = float(os.getenv("VOLATILITY_FILTER", 0.02))
 
-EMAIL_ADDRESS  = "mktalley@gmail.com"
-EMAIL_PASSWORD = "eooncglziamrtcyw"
-TO_EMAIL       = "mktalley@icloud.com"
-EMAIL_HOST     = "smtp.gmail.com"
-EMAIL_PORT     = 587
+# Email settings
+EMAIL_ADDRESS = os.getenv("EMAIL_ADDRESS")
+EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
+TO_EMAIL = os.getenv("TO_EMAIL", EMAIL_ADDRESS)
+EMAIL_HOST = os.getenv("EMAIL_HOST", "smtp.gmail.com")
+EMAIL_PORT = int(os.getenv("EMAIL_PORT", 587))
 
-ET           = pytz.timezone("US/Eastern")
-LUNCH_START  = dt_time(11, 30)
-LUNCH_END    = dt_time(13, 0)
-MARKET_CLOSE = dt_time(16, 0)
+# Timezone and market hours (Eastern)
+ET = pytz.timezone(os.getenv("ET_TIMEZONE", "US/Eastern"))
+LUNCH_START = dt_time(int(os.getenv("LUNCH_START_HOUR", 11)), int(os.getenv("LUNCH_START_MIN", 30)))
+LUNCH_END = dt_time(int(os.getenv("LUNCH_END_HOUR", 13)), int(os.getenv("LUNCH_END_MIN", 0)))
+MARKET_CLOSE = dt_time(int(os.getenv("MARKET_CLOSE_HOUR", 16)), int(os.getenv("MARKET_CLOSE_MIN", 0)))
 
 def is_lunch_time():
     now_et = datetime.now(ET).time()
@@ -52,7 +61,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
-        logging.FileHandler(LOG_FILE_PATH),
+        logging.FileHandler(str(LOG_FILE_PATH)),
         logging.StreamHandler()
     ]
 )
@@ -64,8 +73,11 @@ def retry_api_call(func, *args, retries=5, base_delay=5, **kwargs):
         try:
             return func(*args, **kwargs)
         except Exception as e:
-            if "position does not exist" in str(e) or "symbol not found" in str(e):
+            logging.exception(f"Error calling {func.__name__} — full traceback")
+            # Return None for missing positions or symbols
+            if any(msg in str(e) for msg in ("position does not exist", "symbol not found")):
                 return None
+            # Exponential backoff before retry
             wait = base_delay * (2 ** i)
             logging.warning(f"API call failed: {e}. Retrying in {wait}s...")
             time.sleep(wait)
@@ -155,14 +167,27 @@ def send_email(subject, body):
 logging.info("Market Sentinel bot started.")
 summary = []
 sent_closing_email = False
+last_trading_date = None
 
 while True:
     try:
         clock = retry_api_call(api.get_clock)
         is_open, next_open = clock.is_open, clock.next_open
+
+        # Reset summary and email flag at start of new trading day
+        today_et = datetime.now(ET).date()
+        if is_open and last_trading_date != today_et:
+            summary.clear()
+            sent_closing_email = False
+            last_trading_date = today_et
         if not is_open:
             logging.info(f"Market closed. Sleeping until {next_open}…")
-            time.sleep(600)
+            # Sleep until next market open
+            now = datetime.now(next_open.tzinfo)
+            seconds = (next_open - now).total_seconds()
+            sleep_sec = max(seconds, 60)
+            logging.info(f"Market closed. Sleeping {sleep_sec:.0f}s until {next_open}")
+            time.sleep(sleep_sec)
             continue
 
         cash = float(retry_api_call(api.get_account).cash)
@@ -172,7 +197,12 @@ while True:
             ("Bot A", BOT_A_SYMBOLS_FILE, BUY_TRIGGER_A, SELL_TRIGGER_A, STOP_MULTIPLIER_A),
             ("Bot B", BOT_B_SYMBOLS_FILE, BUY_TRIGGER_B, SELL_TRIGGER_B, STOP_MULTIPLIER_B),
         ]:
-            symbols = retry_api_call(open, file_path).read().split()
+            try:
+                with open(file_path) as f:
+                    symbols = [line.strip() for line in f if line.strip()]
+            except Exception as e:
+                logging.error(f"Failed to read symbols from {file_path}: {e}")
+                continue
             for sym in symbols:
                 price = get_current_price(sym)
                 if not price:
@@ -234,7 +264,6 @@ while True:
             sent_closing_email = True
 
         time.sleep(60)
-
-    except Exception as e:
-        logging.error(f"Main loop error: {e}")
+    except Exception:
+        logging.exception("Main loop error — full traceback")
         time.sleep(60)
