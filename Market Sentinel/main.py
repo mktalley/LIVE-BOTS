@@ -2,6 +2,8 @@ import os, sys, json, time, logging, csv, pytz, smtplib, math
 from pathlib import Path
 from datetime import datetime, date, timedelta, time as dt_time
 from email.mime.text import MIMEText
+from logging.handlers import RotatingFileHandler
+import signal
 from alpaca_trade_api.rest import REST, TimeFrame, APIError
 
 # ─── CONFIG ─────────────────────────────────────────────────────────────────────
@@ -49,6 +51,18 @@ LUNCH_START = dt_time(int(os.getenv("LUNCH_START_HOUR", 11)), int(os.getenv("LUN
 LUNCH_END = dt_time(int(os.getenv("LUNCH_END_HOUR", 13)), int(os.getenv("LUNCH_END_MIN", 0)))
 MARKET_CLOSE = dt_time(int(os.getenv("MARKET_CLOSE_HOUR", 16)), int(os.getenv("MARKET_CLOSE_MIN", 0)))
 
+# Validate required environment variables
+required_env = {
+    "APCA_API_KEY": API_KEY,
+    "APCA_API_SECRET": API_SECRET,
+    "EMAIL_ADDRESS": EMAIL_ADDRESS,
+    "EMAIL_PASSWORD": EMAIL_PASSWORD,
+}
+missing = [name for name, val in required_env.items() if not val]
+if missing:
+    sys.stderr.write(f"Missing required environment variables: {', '.join(missing)}\n")
+    sys.exit(1)
+
 def is_lunch_time():
     now_et = datetime.now(ET).time()
     return LUNCH_START <= now_et < LUNCH_END
@@ -61,7 +75,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
-        logging.FileHandler(str(LOG_FILE_PATH)),
+        RotatingFileHandler(str(LOG_FILE_PATH), maxBytes=10*1024*1024, backupCount=5),
         logging.StreamHandler()
     ]
 )
@@ -153,6 +167,20 @@ def log_trade(action, symbol, qty, price):
             "quantity": qty,
             "price": price
         })
+
+
+# ─── GRACEFUL SHUTDOWN HANDLER ──────────────────────────────────────────
+def graceful_shutdown(signum, frame):
+    logging.info(f"Received signal {signum}, shutting down.")
+    try:
+        if summary and not sent_closing_email:
+            send_email("Early Exit Market Summary", "\n".join(summary))
+    except Exception:
+        logging.exception("Error sending summary on shutdown")
+    sys.exit(0)
+
+signal.signal(signal.SIGINT, graceful_shutdown)
+signal.signal(signal.SIGTERM, graceful_shutdown)
 
 def send_email(subject, body):
     msg = MIMEText(body)
