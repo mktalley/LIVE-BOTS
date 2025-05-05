@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-import os
 import time
 import json
 import requests
@@ -7,201 +6,174 @@ import smtplib
 from datetime import datetime
 from email.mime.text import MIMEText
 import pytz
+from collections import deque
 
-# === CONFIGURATION ===
-BASE_URL    = "https://api.alpaca.markets"
-API_KEY     = "AK8XASA88WMTSRKFMRN3"
-API_SECRET  = "96cnaUhRf4OaGM98QbDZJbCLCuWRmwAKEvreIzEu"
-HEADERS     = {
-    "APCA-API-KEY-ID":     API_KEY,
+# CONFIGURATION
+BASE_URL = "https://api.alpaca.markets"
+API_KEY = "AK8XASA88WMTSRKFMRN3"
+API_SECRET = "96cnaUhRf4OaGM98QbDZJbCLCuWRmwAKEvreIzEu"
+HEADERS = {
+    "APCA-API-KEY-ID": API_KEY,
     "APCA-API-SECRET-KEY": API_SECRET,
-    "Content-Type":        "application/json"
+    "Content-Type": "application/json"
 }
 
+# EMAIL
 EMAIL_HOST = "smtp.gmail.com"
 EMAIL_PORT = 587
 EMAIL_ADDRESS = "mktalley@gmail.com"
 EMAIL_PASSWORD = "eooncglziamrtcyw"
 TO_EMAIL = "mktalley@icloud.com"
 
-symbols = [
-    "UNI/USD","LTC/USD","LINK/USD","DOGE/USD","YFI/USD",
-    "BTC/USD","BCH/USD","CRV/USD","GRT/USD","TRUMP/USD",
-    "BAT/USD","AAVE/USD","XRP/USD","ETH/USD","DOT/USD",
-    "SUSHI/USD","SOL/USD","USDT/USD","SHIB/USD","MKR/USD",
-    "PEPE/USD","AVAX/USD","USDC/USD","XTZ/USD"
-]
+# STRATEGY PARAMETERS
+SYMBOLS = ["BTC/USD", "ETH/USD", "SOL/USD", "LTC/USD", "AVAX/USD"]
+SHORT_EMA_PERIOD = 15   # minutes
+LONG_EMA_PERIOD = 60    # minutes
+ATR_PERIOD = 14         # lookback for ATR calculation
+STOP_ATR_MULT = 1.0     # exit on -1x ATR
+TAKE_ATR_MULT = 2.0     # exit on +2x ATR
+BUY_DIP = -1.0          # % below short EMA to buy
+MIN_DEPTH_USD = 20.0    # min USD at bid for liquidity
+MIN_DAILY_VOL = 100.0   # min 24h volume
+RISK_PER_TRADE_USD = 10.0 # USD risk per trade
+NOTIONAL_USD = 10.0     # fallback notional
 
-BUY_DIP      = -1.5
-SELL_RISE    =  2.0
-STOP_LOSS    = -3.0
-NOTIONAL_USD =  10.0
-DATA_FILE    = "baseline_data.json"
+# Derived constants
+ALPHA_SHORT = 2 / (SHORT_EMA_PERIOD + 1)
+ALPHA_LONG = 2 / (LONG_EMA_PERIOD + 1)
 
-baseline_prices     = {}
-baseline_timestamps = {}
-pnl_by_symbol       = {}
-overall_pnl         = 0.0
-last_email_sent_date = None
+# STATE
+STATE_FILE = "state.json"
+state = {
+    "pnl":        {s: 0.0 for s in SYMBOLS},
+    "overall_pnl": 0.0,
+    "ema_short":  {s: None for s in SYMBOLS},
+    "ema_long":   {s: None for s in SYMBOLS},
+    "entry_price":{s: None for s in SYMBOLS},
+    "last_email": None
+}
+history = {s: deque(maxlen=ATR_PERIOD+1) for s in SYMBOLS}
 
-def get_timestamp():
-    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+
+def now_ts():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def get_orderbook(sym):
+    url = "https://data.alpaca.markets/v1beta3/crypto/us/latest/orderbooks"
+    r = requests.get(url, headers=HEADERS, params={"symbols": sym})
+    r.raise_for_status()
+    ob = r.json()["orderbooks"][sym]
+    price = (ob["b"][0]["p"] + ob["a"][0]["p"]) / 2.0
+    depth = ob["b"][0]["s"] * price
+    return price, depth
+
+
+def get_daily_volume(sym):
+    url = "https://data.alpaca.markets/v1beta2/crypto/us/bars"
+    params = {"symbols": sym, "timeframe": "1Day", "limit": 1}
+    r = requests.get(url, headers=HEADERS, params=params)
+    r.raise_for_status()
+    bars = r.json().get("bars", {}).get(sym, [])
+    return float(bars[0].get("v", 0.0)) if bars else 0.0
+
+
+def get_position(sym):
+    r = requests.get(f"{BASE_URL}/v2/positions/{sym.replace('/','')}", headers=HEADERS)
+    if r.status_code == 200:
+        d = r.json()
+        return float(d.get("qty", 0.0)), float(d.get("avg_entry_price", 0.0))
+    return 0.0, None
+
+
+def place_order(sym, side, otype, val):
+    payload = {"symbol": sym, "side": side, "type": "market", "time_in_force": "gtc"}
+    if otype == "notional": payload["notional"] = str(val)
+    else: payload["qty"] = str(val)
+    r = requests.post(f"{BASE_URL}/v2/orders", headers=HEADERS, json=payload)
+    ts = now_ts()
+    if r.status_code in (200,201): print(f"{ts} ORDER OK: {sym} {side} {otype} {val}")
+    else: print(f"{ts} ORDER FAIL: {sym} {side} {otype} {val} -> {r.status_code}")
+    return r
+
+
+def send_daily_email():
+    today = datetime.now(pytz.timezone("US/Pacific")).date()
+    if state["last_email"] == str(today): return
+    body = f"📈 Daily Crypto P&L – {today}\n\n"
+    for s in SYMBOLS: body += f"{s}: {state['pnl'][s]:+8.2f} USD\n"
+    body += f"\nOverall P&L: {state['overall_pnl']:+8.2f} USD"
+    msg = MIMEText(body); msg["Subject"] = f"Crypto P&L {today}"; msg["From"] = EMAIL_ADDRESS; msg["To"] = TO_EMAIL
+    try:
+        with smtplib.SMTP(EMAIL_HOST, EMAIL_PORT) as srv:
+            srv.starttls(); srv.login(EMAIL_ADDRESS, EMAIL_PASSWORD); srv.sendmail(EMAIL_ADDRESS, TO_EMAIL, msg.as_string())
+        print(f"{now_ts()} Email sent to {TO_EMAIL}"); state["last_email"] = str(today)
+    except Exception as e:
+        print(f"{now_ts()} Email failed: {e}")
+
 
 def load_state():
-    global baseline_prices, baseline_timestamps, pnl_by_symbol, overall_pnl
     try:
-        with open(DATA_FILE) as f:
-            d = json.load(f)
-        baseline_prices     = {k: float(v) for k,v in d.get("prices",{}).items()}
-        baseline_timestamps = {k: float(v) for k,v in d.get("timestamps",{}).items()}
-        pnl_by_symbol       = {k: float(v) for k,v in d.get("pnl_by_symbol",{}).items()}
-        overall_pnl         = float(d.get("overall_pnl", 0.0))
-        print(f"{get_timestamp()} Loaded state from {DATA_FILE}")
+        with open(STATE_FILE) as f: data = json.load(f); state.update(data); print(f"{now_ts()} Loaded state")
     except FileNotFoundError:
-        print(f"{get_timestamp()} No saved state, starting fresh.")
+        print(f"{now_ts()} No state file—fresh start")
     except Exception as e:
-        print(f"{get_timestamp()} Error loading state: {e}")
+        print(f"{now_ts()} Load error: {e}")
+    for s in SYMBOLS:
+        state['pnl'].setdefault(s, 0.0)
+        state['ema_short'].setdefault(s, None)
+        state['ema_long'].setdefault(s, None)
+        state['entry_price'].setdefault(s, None)
+
 
 def save_state():
     try:
-        with open(DATA_FILE, "w") as f:
-            json.dump({
-                "prices":     baseline_prices,
-                "timestamps": baseline_timestamps,
-                "pnl_by_symbol": pnl_by_symbol,
-                "overall_pnl": overall_pnl
-            }, f)
-        print(f"{get_timestamp()} State saved.")
+        with open(STATE_FILE,'w') as f: json.dump(state, f)
+        print(f"{now_ts()} State saved")
     except Exception as e:
-        print(f"{get_timestamp()} Error saving state: {e}")
+        print(f"{now_ts()} Save error: {e}")
 
-def get_market_price(symbol):
-    url = "https://data.alpaca.markets/v1beta3/crypto/us/latest/orderbooks"
-    r = requests.get(url, headers=HEADERS, params={"symbols": symbol})
-    r.raise_for_status()
-    ob = r.json()["orderbooks"][symbol]
-    price = (ob["b"][0]["p"] + ob["a"][0]["p"]) / 2.0
-    return price
-
-def place_order(symbol, side, order_type, value):
-    payload = {"symbol": symbol, "side": side, "type": "market", "time_in_force": "gtc"}
-    if order_type=="notional": payload["notional"] = str(value)
-    else:                      payload["qty"]     = str(value)
-    r = requests.post(f"{BASE_URL}/v2/orders", headers=HEADERS, json=payload)
-    ts = get_timestamp()
-    if r.status_code==200:
-        print(f"{ts} [{symbol}] ✅ {side.upper()} {order_type} {value}")
-    else:
-        print(f"{ts} [{symbol}] ❌ {r.status_code} {r.text}")
-    return r.json()
-
-def get_position(symbol):
-    sym = symbol.replace("/","")
-    r = requests.get(f"{BASE_URL}/v2/positions/{sym}", headers=HEADERS)
-    if r.status_code==200:
-        d = r.json()
-        return float(d["qty"]), float(d["avg_entry_price"])
-    return 0.0, None
-
-def send_daily_email():
-    global last_email_sent_date
-
-    today = datetime.now(pytz.timezone("US/Pacific")).date()
-    if last_email_sent_date == today:
-        return
-
-    body = f"📈 Daily Trade Summary – {today.strftime('%Y-%m-%d')}\n\n"
-    for symbol, pnl in pnl_by_symbol.items():
-        body += f"{symbol}: {pnl:+.2f} USD\n"
-    body += f"\nTotal P&L: {overall_pnl:+.2f} USD"
-
-    msg = MIMEText(body)
-    msg["Subject"] = f"Daily Crypto P&L Report – {today.strftime('%Y-%m-%d')}"
-    msg["From"] = EMAIL_ADDRESS
-    msg["To"] = TO_EMAIL
-
-    try:
-        with smtplib.SMTP(EMAIL_HOST, EMAIL_PORT) as server:
-            server.starttls()
-            server.login(EMAIL_ADDRESS, EMAIL_PASSWORD)
-            server.sendmail(EMAIL_ADDRESS, TO_EMAIL, msg.as_string())
-        print(f"{get_timestamp()} ✅ Email sent")
-        last_email_sent_date = today
-    except Exception as e:
-        print(f"{get_timestamp()} ❌ Failed to send email: {e}")
 
 def main():
-    global overall_pnl
-
     load_state()
-    for s in symbols:
-        pnl_by_symbol.setdefault(s, 0.0)
-
-    for s in symbols:
-        try:
-            if s not in baseline_prices:
-                qty, avg = get_position(s)
-                baseline_prices[s] = avg if qty > 0 and avg else get_market_price(s)
-                baseline_timestamps[s] = time.time()
-                print(f"{get_timestamp()} [{s}] Baseline → {baseline_prices[s]:.8f}")
-            else:
-                print(f"{get_timestamp()} [{s}] Using saved baseline {baseline_prices[s]:.8f}")
-        except Exception as e:
-            print(f"{get_timestamp()} [{s}] Err init baseline: {e}")
-
+    for s in SYMBOLS:
+        if state['ema_short'][s] is None:
+            p,_ = get_orderbook(s); state['ema_short'][s] = p; state['ema_long'][s] = p; history[s].extend([p]*(ATR_PERIOD+1)); print(f"{now_ts()} Init {s}: EMA={p:.2f}")
     save_state()
-
-    while True:
-        for s in symbols:
-            try:
-                price = get_market_price(s)
-                ts    = get_timestamp()
-                last  = baseline_prices.get(s, price)
-                if last == 0:
-                    last = price
-                    baseline_timestamps[s] = time.time()
-
-                pct = (price - last)/last*100
-                qty, _ = get_position(s)
-
-                print(f"{ts} [{s}] ${price:.4f} ({pct:+.2f}%)  Pos={qty}")
-
-                if qty==0 and time.time()-baseline_timestamps[s] > 6*3600:
-                    baseline_prices[s]=price
-                    baseline_timestamps[s]=time.time()
-                    print(f"{ts} [{s}] Baseline refreshed to {price:.8f}")
-
-                if qty==0 and pct <= BUY_DIP:
-                    print(f"{ts} [{s}] Dip {BUY_DIP}% hit → BUY ${NOTIONAL_USD}")
-                    place_order(s, "buy", "notional", NOTIONAL_USD)
-                    baseline_prices[s]=price; baseline_timestamps[s]=time.time()
-
-                elif qty>0 and pct <= STOP_LOSS:
-                    trade_pnl = (price - last)*qty
-                    pnl_by_symbol[s] += trade_pnl; overall_pnl += trade_pnl
-                    print(f"{ts} [{s}] Stop {STOP_LOSS}% → SELL qty {qty}")
-                    place_order(s, "sell", "qty", qty)
-                    print(f"{ts}] Trade PnL={trade_pnl:.4f}  Tot PnL={overall_pnl:.4f}")
-                    baseline_prices[s]=price; baseline_timestamps[s]=time.time()
-
-                elif qty>0 and pct >= SELL_RISE:
-                    trade_pnl = (price - last)*qty
-                    pnl_by_symbol[s] += trade_pnl; overall_pnl += trade_pnl
-                    print(f"{ts} [{s}] Rise {SELL_RISE}% → SELL qty {qty}")
-                    place_order(s, "sell", "qty", qty)
-                    print(f"{ts}] Trade PnL={trade_pnl:.4f}  Tot PnL={overall_pnl:.4f}")
-                    baseline_prices[s]=price; baseline_timestamps[s]=time.time()
-
-            except Exception as e:
-                print(f"{get_timestamp()} [{s}] Err during monitor: {e}")
-
-        now_pacific = datetime.now(pytz.timezone("US/Pacific"))
-        if now_pacific.hour == 22 and now_pacific.minute < 5:
-            send_daily_email()
-
-        print(f"{get_timestamp()} Overall PnL: {overall_pnl:.4f}")
-        save_state()
-        time.sleep(60)
+    try:
+        while True:
+            for s in SYMBOLS:
+                try:
+                    price,depth = get_orderbook(s)
+                    ps,pl = state['ema_short'][s], state['ema_long'][s]
+                    state['ema_short'][s] = ALPHA_SHORT*price + (1-ALPHA_SHORT)*ps
+                    state['ema_long'][s]  = ALPHA_LONG*price  + (1-ALPHA_LONG)*pl
+                    history[s].append(price)
+                    atr = sum(abs(history[s][i] - history[s][i-1]) for i in range(1, len(history[s]))) / ATR_PERIOD if len(history[s])==ATR_PERIOD+1 else 0.0
+                    vol24 = get_daily_volume(s)
+                    qty,avg = get_position(s)
+                    if qty>0 and state['entry_price'][s] is None: state['entry_price'][s] = avg
+                    if qty==0 and price>state['ema_long'][s]:
+                        pct = (price - state['ema_short'][s]) / state['ema_short'][s] * 100
+                        if pct <= BUY_DIP and depth>=MIN_DEPTH_USD and vol24>=MIN_DAILY_VOL:
+                            size = (RISK_PER_TRADE_USD/atr) if atr>0 else (NOTIONAL_USD/price)
+                            size = round(size,6)
+                            print(f"{now_ts()} {s} dip {pct:.2f}% ATR={atr:.2f} VOL={vol24:.2f} -> BUY qty={size}")
+                            place_order(s,'buy','qty',size); state['entry_price'][s] = price
+                    elif qty>0:
+                        entry = state['entry_price'][s]; delta = price - entry
+                        if atr>0 and (delta<= -STOP_ATR_MULT*atr or delta>= TAKE_ATR_MULT*atr):
+                            tag = 'STOP' if delta<= -STOP_ATR_MULT*atr else 'TAKE'
+                            print(f"{now_ts()} {s} {tag} {delta:.2f}% -> SELL qty={qty}")
+                            place_order(s,'sell','qty',qty)
+                            pnl = delta*qty; state['pnl'][s]+=pnl; state['overall_pnl']+=pnl; state['entry_price'][s]=None
+                    print(f"{now_ts()} {s} Price={price:.2f} EMA15={ps:.2f} EMA60={pl:.2f} ATR={atr:.2f} VOL={vol24:.2f} Pos={qty}")
+                except Exception as e:
+                    print(f"{now_ts()} {s} error: {e}")
+            send_daily_email(); print(f"{now_ts()} Overall P&L: {state['overall_pnl']:+.2f} USD"); save_state()
+            time.sleep(60)
+    except KeyboardInterrupt:
+        print("Interrupted, saving state..."); save_state()
 
 if __name__ == "__main__":
     main()
