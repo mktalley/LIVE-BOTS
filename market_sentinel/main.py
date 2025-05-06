@@ -2,7 +2,21 @@ import os, sys, json, time, logging, csv, pytz, smtplib, math
 from pathlib import Path
 from datetime import datetime, date, timedelta, time as dt_time
 from email.mime.text import MIMEText
+from logging.handlers import RotatingFileHandler
+import signal
+import random
 from alpaca_trade_api.rest import REST, TimeFrame, APIError
+from collections import deque, defaultdict
+from typing import Sequence, Optional
+
+
+
+def compute_sma(prices: Sequence[float]) -> Optional[float]:
+    """Compute Simple Moving Average if enough data points are available."""
+    if len(prices) < SMA_PERIOD:
+        return None
+    return sum(prices) / len(prices)
+
 
 # ─── CONFIG ─────────────────────────────────────────────────────────────────────
 # Load credentials and settings from environment
@@ -35,6 +49,14 @@ RISK_PCT = float(os.getenv("RISK_PCT", 0.015))
 RESET_HOURS = int(os.getenv("RESET_HOURS", 6))
 BASELINE_DRIFT = float(os.getenv("BASELINE_DRIFT", 0.05))
 VOLATILITY_FILTER = float(os.getenv("VOLATILITY_FILTER", 0.02))
+# Simple moving average period for trend filter
+SMA_PERIOD = int(os.getenv("SMA_PERIOD", 20))
+
+# Circuit breaker settings
+CIRCUIT_BREAKER_THRESHOLD = int(os.getenv("CIRCUIT_BREAKER_THRESHOLD", 5))
+CIRCUIT_BREAKER_COOLDOWN = int(os.getenv("CIRCUIT_BREAKER_COOLDOWN", 60))
+# Track consecutive API call failures
+error_streak = 0
 
 # Email settings
 EMAIL_ADDRESS = os.getenv("EMAIL_ADDRESS")
@@ -49,6 +71,19 @@ LUNCH_START = dt_time(int(os.getenv("LUNCH_START_HOUR", 11)), int(os.getenv("LUN
 LUNCH_END = dt_time(int(os.getenv("LUNCH_END_HOUR", 13)), int(os.getenv("LUNCH_END_MIN", 0)))
 MARKET_CLOSE = dt_time(int(os.getenv("MARKET_CLOSE_HOUR", 16)), int(os.getenv("MARKET_CLOSE_MIN", 0)))
 
+# Validate required environment variables
+required_env = {
+    "APCA_API_KEY": API_KEY,
+    "APCA_API_SECRET": API_SECRET,
+    "EMAIL_ADDRESS": EMAIL_ADDRESS,
+    "EMAIL_PASSWORD": EMAIL_PASSWORD,
+}
+missing = [name for name, val in required_env.items() if not val]
+if missing:
+    sys.stderr.write(f"Missing required environment variables: {', '.join(missing)}\n")
+    if __name__ == "__main__":
+        sys.exit(1)
+
 def is_lunch_time():
     now_et = datetime.now(ET).time()
     return LUNCH_START <= now_et < LUNCH_END
@@ -61,25 +96,40 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
-        logging.FileHandler(str(LOG_FILE_PATH)),
+        RotatingFileHandler(str(LOG_FILE_PATH), maxBytes=10*1024*1024, backupCount=5),
         logging.StreamHandler()
     ]
 )
-api = REST(API_KEY, API_SECRET, BASE_URL)
+api = None
+if __name__ == "__main__":
+    api = REST(API_KEY, API_SECRET, BASE_URL)
 
 # ─── EXPONENTIAL BACKOFF ────────────────────────────────────────────────────────
 def retry_api_call(func, *args, retries=5, base_delay=5, **kwargs):
+    global error_streak
     for i in range(retries):
         try:
-            return func(*args, **kwargs)
+            result = func(*args, **kwargs)
+            # reset error streak on success
+            error_streak = 0
+            return result
         except Exception as e:
-            logging.exception(f"Error calling {func.__name__} — full traceback")
             # Return None for missing positions or symbols
             if any(msg in str(e) for msg in ("position does not exist", "symbol not found")):
                 return None
-            # Exponential backoff before retry
-            wait = base_delay * (2 ** i)
-            logging.warning(f"API call failed: {e}. Retrying in {wait}s...")
+            # increment error streak
+            error_streak += 1
+            logging.exception(f"Error calling {func.__name__} — full traceback")
+            # Circuit breaker: cooldown on too many consecutive errors
+            if error_streak >= CIRCUIT_BREAKER_THRESHOLD:
+                logging.error(f"Circuit breaker tripped after {error_streak} errors. Cooling down for {CIRCUIT_BREAKER_COOLDOWN}s.")
+                time.sleep(CIRCUIT_BREAKER_COOLDOWN)
+                error_streak = 0
+                return None
+            # Jittered exponential backoff
+            jitter = random.uniform(0.5, 1.5)
+            wait = base_delay * (2 ** i) * jitter
+            logging.warning(f"API call failed: {e}. Retrying in {wait:.1f}s...")
             time.sleep(wait)
     raise RuntimeError(f"API call failed after {retries} retries: {func.__name__}")
 
@@ -106,13 +156,20 @@ def save_baselines(baselines):
         json.dump(dump, f, indent=2)
 
 def record_price_history(symbol, price, baseline):
-    with open(PRICE_HISTORY_FILE, "a", newline="") as f:
-        writer = csv.writer(f)
-        if f.tell() == 0:
-            writer.writerow(["timestamp", "symbol", "price", "baseline"])
-        writer.writerow([datetime.utcnow().isoformat(), symbol, price, baseline])
+    try:
+        with open(PRICE_HISTORY_FILE, "a", newline="") as f:
+            writer = csv.writer(f)
+            if f.tell() == 0:
+                writer.writerow(["timestamp", "symbol", "price", "baseline"])
+            writer.writerow([datetime.utcnow().isoformat(), symbol, price, baseline])
+    except Exception as e:
+        logging.error(f"Failed to record price history: {e}")
 
 baselines = load_baselines()
+
+
+# Sliding windows for SMA trend filter
+price_windows = defaultdict(lambda: deque(maxlen=SMA_PERIOD))
 
 # ─── POSITION & PRICE HELPERS ──────────────────────────────────────────────────
 def get_position_info(symbol):
@@ -154,6 +211,20 @@ def log_trade(action, symbol, qty, price):
             "price": price
         })
 
+
+# ─── GRACEFUL SHUTDOWN HANDLER ──────────────────────────────────────────
+def graceful_shutdown(signum, frame):
+    logging.info(f"Received signal {signum}, shutting down.")
+    try:
+        if summary and not sent_closing_email:
+            send_email("Early Exit Market Summary", "\n".join(summary))
+    except Exception:
+        logging.exception("Error sending summary on shutdown")
+    sys.exit(0)
+
+signal.signal(signal.SIGINT, graceful_shutdown)
+signal.signal(signal.SIGTERM, graceful_shutdown)
+
 def send_email(subject, body):
     msg = MIMEText(body)
     msg["Subject"] = subject
@@ -169,7 +240,7 @@ summary = []
 sent_closing_email = False
 last_trading_date = None
 
-while True:
+while api is not None:
     try:
         clock = retry_api_call(api.get_clock)
         is_open, next_open = clock.is_open, clock.next_open
@@ -229,6 +300,15 @@ while True:
 
                 base_price = baselines[sym]["price"]
                 record_price_history(sym, price, base_price)
+                # SMA trend filter
+                price_windows[sym].append(price)
+                sma = compute_sma(price_windows[sym])
+                if sma is None:
+                    logging.info(f"[{bot_name}][{sym}] Waiting for SMA warm-up ({len(price_windows[sym])}/{SMA_PERIOD})")
+                    continue
+                trend_ok = price > sma
+                logging.info(f"[{bot_name}][{sym}] SMA:{sma:.2f}, Trend:{'PASS' if trend_ok else 'FAIL'}")
+
 
                 buy_price = base_price * bt
                 sell_price = base_price * st
@@ -238,7 +318,7 @@ while True:
                     f"[{bot_name}][{sym}] Base:${base_price:.2f}, Curr:${price:.2f}, Buy@${buy_price:.2f}, Sell@${sell_price:.2f}, Stop@${stop_price:.2f}, Owned={qty:.4f}"
                 )
 
-                if qty == 0 and price <= buy_price and not is_lunch_time():
+                if qty == 0 and price <= buy_price and trend_ok and not is_lunch_time():
                     qty_to_buy = round((cash * RISK_PCT) / price, 6)
                     retry_api_call(api.submit_order, symbol=sym, qty=qty_to_buy, side="buy", type="market", time_in_force="day")
                     log_trade("buy", sym, qty_to_buy, price)
