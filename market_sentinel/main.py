@@ -258,12 +258,14 @@ while api is not None:
             sent_closing_email = False
             last_trading_date = today_et
         if not is_open:
-            logging.info(f"Market closed. Sleeping until {next_open}…")
-            # Sleep until next market open
+            # Market closed: wait until open, waking up at most every minute
             now = datetime.now(next_open.tzinfo)
-            seconds = (next_open - now).total_seconds()
-            sleep_sec = max(seconds, 60)
-            logging.info(f"Market closed. Sleeping {sleep_sec:.0f}s until {next_open}")
+            seconds_until_open = (next_open - now).total_seconds()
+            if seconds_until_open <= 0:
+                # Open time reached; recheck immediately
+                continue
+            sleep_sec = min(seconds_until_open, 60)
+            logging.info(f"Market closed. Sleeping {sleep_sec:.0f}s until next open at {next_open}")
             time.sleep(sleep_sec)
             continue
 
