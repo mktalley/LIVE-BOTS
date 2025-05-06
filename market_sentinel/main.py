@@ -8,6 +8,21 @@ import random
 from alpaca_trade_api.rest import REST, TimeFrame, APIError
 from collections import deque, defaultdict
 from typing import Sequence, Optional
+# Load environment variables from .env file in repository root, if present
+env_path = Path(__file__).parent.parent / '.env'
+if env_path.exists():
+    for line in env_path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith('#'):
+            continue
+        key, sep, val = line.partition('=')
+        if not sep:
+            continue
+        key = key.strip()
+        # Remove inline comments
+        val = val.split('#', 1)[0].strip()
+        os.environ.setdefault(key, val)
+
 
 
 
@@ -19,10 +34,12 @@ def compute_sma(prices: Sequence[float]) -> Optional[float]:
 
 
 # ─── CONFIG ─────────────────────────────────────────────────────────────────────
-# Load credentials and settings from environment
-API_KEY = os.getenv("APCA_API_KEY")
-API_SECRET = os.getenv("APCA_API_SECRET")
-BASE_URL = os.getenv("APCA_BASE_URL", "https://api.alpaca.markets")
+# Load credentials and settings from environment (support legacy .env keys)
+# API key/secret: allow APCA_* or (legacy) APCA_*_ID, APCA_*_KEY
+API_KEY = os.getenv("APCA_API_KEY") or os.getenv("APCA_API_KEY_ID")
+API_SECRET = os.getenv("APCA_API_SECRET") or os.getenv("APCA_API_SECRET_KEY")
+# Base URL: allow APCA_BASE_URL or (legacy) ALPACA_BASE_URL, default to production
+BASE_URL = os.getenv("APCA_BASE_URL") or os.getenv("ALPACA_BASE_URL") or "https://api.alpaca.markets"
 
 # Directory for local files
 BASE_DIR = Path(__file__).parent
