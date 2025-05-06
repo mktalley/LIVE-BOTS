@@ -7,23 +7,45 @@ from datetime import datetime
 from email.mime.text import MIMEText
 import pytz
 from collections import deque
+import os
+from pathlib import Path
+
+# Load environment variables from .env file
+# The .env file should be located at the repository root
+env_path = Path(__file__).parent.parent / '.env'
+if env_path.exists():
+    with open(env_path) as f:
+        for line in f:
+            raw = line.strip()
+            if not raw or raw.startswith('#'):
+                continue
+            key, _, val = raw.partition('=')
+            key = key.strip()
+            # strip inline comments from value
+            val = val.split('#', 1)[0].strip()
+            os.environ[key] = val
+
 
 # CONFIGURATION
-BASE_URL = "https://api.alpaca.markets"
-API_KEY = "AK8XASA88WMTSRKFMRN3"
-API_SECRET = "96cnaUhRf4OaGM98QbDZJbCLCuWRmwAKEvreIzEu"
+BASE_URL = os.getenv("ALPACA_BASE_URL", "https://api.alpaca.markets").strip()  # can override via env
+API_KEY = os.getenv("APCA_API_KEY_ID", "").strip()
+API_SECRET = os.getenv("APCA_API_SECRET_KEY", "").strip()
+if not API_KEY or not API_SECRET:
+    raise RuntimeError("Missing Alpaca API credentials: APCA_API_KEY_ID and APCA_API_SECRET_KEY must be set in .env")
 HEADERS = {
     "APCA-API-KEY-ID": API_KEY,
     "APCA-API-SECRET-KEY": API_SECRET,
     "Content-Type": "application/json"
 }
 
-# EMAIL
-EMAIL_HOST = "smtp.gmail.com"
-EMAIL_PORT = 587
-EMAIL_ADDRESS = "mktalley@gmail.com"
-EMAIL_PASSWORD = "eooncglziamrtcyw"
-TO_EMAIL = "mktalley@icloud.com"
+# EMAIL SETTINGS
+EMAIL_HOST = os.getenv("EMAIL_HOST", "smtp.gmail.com")
+EMAIL_PORT = int(os.getenv("EMAIL_PORT", 587))
+EMAIL_ADDRESS = os.getenv("EMAIL_ADDRESS")
+EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
+TO_EMAIL = os.getenv("TO_EMAIL")
+if not all([EMAIL_ADDRESS, EMAIL_PASSWORD, TO_EMAIL]):
+    raise RuntimeError("Missing email credentials: EMAIL_ADDRESS, EMAIL_PASSWORD, TO_EMAIL")
 
 # STRATEGY PARAMETERS
 TOP_N_SYMBOLS = 5   # select top N cryptos by 24h volume
@@ -53,9 +75,9 @@ LONG_EMA_PERIOD = 60    # minutes
 ATR_PERIOD = 14         # lookback for ATR calculation
 STOP_ATR_MULT = 1.0     # exit on -1x ATR
 TAKE_ATR_MULT = 2.0     # exit on +2x ATR
-BUY_DIP = -1.0          # % below short EMA to buy
+BUY_DIP = -0.1          # % below short EMA to buy
 MIN_DEPTH_USD = 20.0    # min USD at bid for liquidity
-MIN_DAILY_VOL = 100.0   # min 24h volume
+MIN_DAILY_VOL_USD = 10000.0   # min 24h USD volume   # min 24h volume
 RISK_PER_TRADE_USD = 10.0 # USD risk per trade
 NOTIONAL_USD = 10.0     # fallback notional
 
@@ -75,9 +97,21 @@ state = {
 }
 history = {s: deque(maxlen=ATR_PERIOD+1) for s in SYMBOLS}
 
+# utility: seed ATR history with real 1-min bars
+def seed_history(sym):
+    # fetch last ATR_PERIOD+1 1-minute bars to seed ATR history
+    url = "https://data.alpaca.markets/v1beta3/crypto/us/bars"
+    params = {"symbols": sym, "timeframe": "1Min", "limit": ATR_PERIOD+1}
+    r = requests.get(url, headers=HEADERS, params=params)
+    r.raise_for_status()
+    bars = r.json().get("bars", {}).get(sym, [])
+    return [b.get("c", 0.0) for b in bars]
+
+
 
 def now_ts():
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    # timestamp in US/Pacific
+    return datetime.now(pytz.timezone("US/Pacific")).strftime("%Y-%m-%d %H:%M:%S %Z")
 
 
 def get_orderbook(sym):
@@ -91,11 +125,14 @@ def get_orderbook(sym):
 
 
 def get_daily_volume(sym):
-    url = "https://data.alpaca.markets/v1beta2/crypto/us/bars"
+    # fetch 1-day bar for the crypto symbol
+    url = "https://data.alpaca.markets/v1beta3/crypto/us/bars"
     params = {"symbols": sym, "timeframe": "1Day", "limit": 1}
+    
     r = requests.get(url, headers=HEADERS, params=params)
     r.raise_for_status()
-    bars = r.json().get("bars", {}).get(sym, [])
+    data = r.json().get("bars", {})
+    bars = data.get(sym, [])
     return float(bars[0].get("v", 0.0)) if bars else 0.0
 
 
@@ -108,7 +145,9 @@ def get_position(sym):
 
 
 def place_order(sym, side, otype, val):
-    payload = {"symbol": sym, "side": side, "type": "market", "time_in_force": "gtc"}
+    # use symbol without slash for trading API calls
+    symbol = sym.replace("/", "")
+    payload = {"symbol": symbol, "side": side, "type": "market", "time_in_force": "gtc"}
     if otype == "notional": payload["notional"] = str(val)
     else: payload["qty"] = str(val)
     r = requests.post(f"{BASE_URL}/v2/orders", headers=HEADERS, json=payload)
@@ -159,7 +198,22 @@ def main():
     load_state()
     for s in SYMBOLS:
         if state['ema_short'][s] is None:
-            p,_ = get_orderbook(s); state['ema_short'][s] = p; state['ema_long'][s] = p; history[s].extend([p]*(ATR_PERIOD+1)); print(f"{now_ts()} Init {s}: EMA={p:.2f}")
+            # seed history for ATR from real 1-min bars
+            prices = seed_history(s)
+            if len(prices) == ATR_PERIOD+1:
+                history[s].clear()
+                history[s].extend(prices)
+                last = prices[-1]
+                state['ema_short'][s] = last
+                state['ema_long'][s] = last
+                print(f"{now_ts()} Seed {s}: last={last:.2f}, ATR seeded")
+            else:
+                # fallback to current price if insufficient history
+                p,_ = get_orderbook(s)
+                state['ema_short'][s] = p
+                state['ema_long'][s] = p
+                history[s].extend([p] * (ATR_PERIOD+1))
+                print(f"{now_ts()} Init {s}: EMA={p:.2f}")
     save_state()
     try:
         while True:
@@ -172,11 +226,13 @@ def main():
                     history[s].append(price)
                     atr = sum(abs(history[s][i] - history[s][i-1]) for i in range(1, len(history[s]))) / ATR_PERIOD if len(history[s])==ATR_PERIOD+1 else 0.0
                     vol24 = get_daily_volume(s)
+                    # convert 24h coin volume to USD
+                    vol24_usd = vol24 * price
                     qty,avg = get_position(s)
                     if qty>0 and state['entry_price'][s] is None: state['entry_price'][s] = avg
                     if qty==0 and price>state['ema_long'][s]:
                         pct = (price - state['ema_short'][s]) / state['ema_short'][s] * 100
-                        if pct <= BUY_DIP and depth>=MIN_DEPTH_USD and vol24>=MIN_DAILY_VOL:
+                        if pct <= BUY_DIP and depth >= MIN_DEPTH_USD and vol24_usd >= MIN_DAILY_VOL_USD:
                             size = (RISK_PER_TRADE_USD/atr) if atr>0 else (NOTIONAL_USD/price)
                             size = round(size,6)
                             print(f"{now_ts()} {s} dip {pct:.2f}% ATR={atr:.2f} VOL={vol24:.2f} -> BUY qty={size}")
