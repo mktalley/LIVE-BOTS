@@ -166,7 +166,12 @@ def load_baselines():
     now = datetime.now(PT)
     for sym, data in raw.items():
         if isinstance(data, dict) and "price" in data:
-            ts = datetime.fromisoformat(data.get("ts", now.isoformat()))
+            # Parse stored timestamp; ensure timezone-aware in PT
+            ts_str = data.get("ts", now.isoformat())
+            ts = datetime.fromisoformat(ts_str)
+            if ts.tzinfo is None:
+                # assume stored naive timestamps are in PT
+                ts = PT.localize(ts)
             out[sym] = {"price": data["price"], "ts": ts}
     return out
 
@@ -262,6 +267,7 @@ logging.info("Market Sentinel bot started.")
 summary = []
 sent_closing_email = False
 last_trading_date = None
+purchase_dates = {}
 
 while api is not None:
     try:
@@ -272,6 +278,7 @@ while api is not None:
         today_et = datetime.now(ET).date()
         if is_open and last_trading_date != today_et:
             summary.clear()
+            purchase_dates.clear()
             sent_closing_email = False
             last_trading_date = today_et
         if not is_open:
@@ -347,8 +354,12 @@ while api is not None:
                     qty_to_buy = round((cash * RISK_PCT) / price, 6)
                     retry_api_call(api.submit_order, symbol=sym, qty=qty_to_buy, side="buy", type="market", time_in_force="day")
                     log_trade("buy", sym, qty_to_buy, price)
+                    purchase_dates[sym] = now.date()
                     summary.append(f"[{bot_name}] BUY {qty_to_buy:.6f} of {sym} @ ${price:.2f}")
                 elif qty > 0:
+                    if purchase_dates.get(sym) == now.date():
+                        logging.info(f"[{bot_name}][{sym}] Skipping same-day sell")
+                        continue
                     if price >= sell_price:
                         retry_api_call(api.submit_order, symbol=sym, qty=qty, side="sell", type="market", time_in_force="day")
                         log_trade("sell", sym, qty, price)
