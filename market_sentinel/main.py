@@ -195,9 +195,45 @@ def record_price_history(symbol, price, baseline):
 
 baselines = load_baselines()
 
+# ─── SMA WINDOW PERSISTENCE ────────────────────────────────────────────────
+def load_price_windows():
+    """Load SMA warmup windows from price_history.csv for the current trading day."""
+    windows = defaultdict(lambda: deque(maxlen=SMA_PERIOD))
+    try:
+        if PRICE_HISTORY_FILE.exists():
+            with open(PRICE_HISTORY_FILE, newline="") as f:
+                reader = csv.reader(f)
+                _ = next(reader, None)
+                for row in reader:
+                    # row: [timestamp, symbol, price, baseline]
+                    ts_str, sym, price_str, *_ = row
+                    try:
+                        dt_ts = datetime.fromisoformat(ts_str)
+                    except ValueError:
+                        continue
+                    # Convert to ET and filter by today's date
+                    dt_ts = dt_ts.astimezone(ET)
+                    if dt_ts.date() == datetime.now(ET).date():
+                        windows[sym].append(float(price_str))
+    except Exception as e:
+        logging.error(f"Failed to load price windows: {e}")
+    # Log preloaded window sizes
+    # Log preloaded window sizes and SMA if complete
+    infos = []
+    for s, w in windows.items():
+        sma_val = compute_sma(w)
+        if sma_val is not None:
+            infos.append(f"{s}: {len(w)}/{SMA_PERIOD} (SMA={sma_val:.2f})")
+        else:
+            infos.append(f"{s}: {len(w)}/{SMA_PERIOD}")
+    if infos:
+        logging.info(f"Preloaded SMA windows: {', '.join(infos)}")
+    return windows
 
-# Sliding windows for SMA trend filter
-price_windows = defaultdict(lambda: deque(maxlen=SMA_PERIOD))
+
+
+# Sliding windows for SMA trend filter (preload from price history to skip warmup if restarted)
+price_windows = load_price_windows()
 
 # ─── POSITION & PRICE HELPERS ──────────────────────────────────────────────────
 def get_position_info(symbol):
