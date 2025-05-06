@@ -70,6 +70,8 @@ ET = pytz.timezone(os.getenv("ET_TIMEZONE", "US/Eastern"))
 LUNCH_START = dt_time(int(os.getenv("LUNCH_START_HOUR", 11)), int(os.getenv("LUNCH_START_MIN", 30)))
 LUNCH_END = dt_time(int(os.getenv("LUNCH_END_HOUR", 13)), int(os.getenv("LUNCH_END_MIN", 0)))
 MARKET_CLOSE = dt_time(int(os.getenv("MARKET_CLOSE_HOUR", 16)), int(os.getenv("MARKET_CLOSE_MIN", 0)))
+PT = pytz.timezone(os.getenv("PT_TIMEZONE", "US/Pacific"))  # Pacific Time
+
 
 # Validate required environment variables
 required_env = {
@@ -92,14 +94,18 @@ def is_market_close():
     now_et = datetime.now(ET).time()
     return now_et >= MARKET_CLOSE
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        RotatingFileHandler(str(LOG_FILE_PATH), maxBytes=10*1024*1024, backupCount=5),
-        logging.StreamHandler()
-    ]
-)
+# Configure logging in Pacific Time
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", "%Y-%m-%d %H:%M:%S")
+formatter.converter = lambda *args: datetime.now(PT).timetuple()
+file_handler = RotatingFileHandler(str(LOG_FILE_PATH), maxBytes=10*1024*1024, backupCount=5)
+file_handler.setFormatter(formatter)
+stream_handler = logging.StreamHandler()
+stream_handler.setFormatter(formatter)
+logger.handlers.clear()
+logger.addHandler(file_handler)
+logger.addHandler(stream_handler)
 api = None
 if __name__ == "__main__":
     api = REST(API_KEY, API_SECRET, BASE_URL)
@@ -140,7 +146,7 @@ def load_baselines():
     with open(BASELINE_FILE) as f:
         raw = json.load(f)
     out = {}
-    now = datetime.utcnow()
+    now = datetime.now(PT)
     for sym, data in raw.items():
         if isinstance(data, dict) and "price" in data:
             ts = datetime.fromisoformat(data.get("ts", now.isoformat()))
@@ -161,7 +167,7 @@ def record_price_history(symbol, price, baseline):
             writer = csv.writer(f)
             if f.tell() == 0:
                 writer.writerow(["timestamp", "symbol", "price", "baseline"])
-            writer.writerow([datetime.utcnow().isoformat(), symbol, price, baseline])
+            writer.writerow([datetime.now(PT).isoformat(), symbol, price, baseline])
     except Exception as e:
         logging.error(f"Failed to record price history: {e}")
 
@@ -204,7 +210,7 @@ def log_trade(action, symbol, qty, price):
         if not file_exists:
             writer.writeheader()
         writer.writerow({
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(PT).isoformat(),
             "action": action,
             "symbol": symbol,
             "quantity": qty,
@@ -280,7 +286,7 @@ while api is not None:
                     continue
                 qty, avg_entry = get_position_info(sym)
 
-                now = datetime.utcnow()
+                now = datetime.now(PT)
                 bl = baselines.get(sym)
                 atr = calculate_atr(sym) or 0
 
