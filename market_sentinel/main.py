@@ -1,13 +1,77 @@
-import os, sys, json, time, logging, csv, pytz, smtplib, math
-from pathlib import Path
+# Standard library
+import csv
+import json
+import logging
+import os
+import signal
+import sys
+import time
+from collections import deque, defaultdict
 from datetime import datetime, date, timedelta, time as dt_time
+from pathlib import Path
+import uuid
+from typing import Sequence, Optional
+
+# Third-party
+import pytz
+import smtplib
 from email.mime.text import MIMEText
 from logging.handlers import RotatingFileHandler
-import signal
-import random
 from alpaca_trade_api.rest import REST, TimeFrame, APIError
-from collections import deque, defaultdict
-from typing import Sequence, Optional
+
+# Local
+from market_sentinel.positions import load_positions, save_positions
+
+def migrate_trade_log():
+    """Backup legacy trade_log.csv without trade_id header to a .legacy_ timestamped file."""
+    if os.path.isfile(TRADE_LOG_FILE):
+        with open(TRADE_LOG_FILE) as f:
+            header = f.readline()
+        if 'trade_id' not in header:
+            ts = datetime.now(PT).strftime('%Y%m%d_%H%M%S')
+            new_name = TRADE_LOG_FILE.parent / f"{TRADE_LOG_FILE.stem}.legacy_{ts}.csv"
+            os.rename(TRADE_LOG_FILE, new_name)
+            logging.info(f"Migrated legacy trade log to {new_name}")
+    # Ensure fresh trade_log.csv exists with header
+    if not os.path.isfile(TRADE_LOG_FILE):
+        with open(TRADE_LOG_FILE, mode="w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=["timestamp", "action", "trade_id", "symbol", "quantity", "entry_price", "price", "profit"])
+            writer.writeheader()
+            logging.info(f"Initialized new trade log at {TRADE_LOG_FILE}")
+
+
+
+def validate_trades():
+    """Validate trade_log for mismatches: sells without buys, duplicate closes, same-day anomalies."""
+    if not os.path.isfile(TRADE_LOG_FILE):
+        return
+    buy_dates = {}
+    sell_counts = defaultdict(int)
+    with open(TRADE_LOG_FILE) as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            trade_id = row.get('trade_id') or None
+            action = row.get('action')
+            ts = row.get('timestamp')
+            try:
+                dt = datetime.fromisoformat(ts)
+            except Exception:
+                continue
+            d = dt.date()
+            if action == 'buy':
+                if trade_id:
+                    buy_dates[trade_id] = d
+            elif action == 'sell':
+                sell_counts[trade_id] += 1
+                if not trade_id or trade_id not in buy_dates:
+                    logging.warning(f"Validation: sell without matching buy: {row}")
+                if sell_counts[trade_id] > 1:
+                    logging.warning(f"Validation: duplicate close for trade_id {trade_id}")
+                buy_d = buy_dates.get(trade_id)
+                if buy_d and buy_d == d:
+                    logging.warning(f"Validation: same-day buy and sell for trade_id {trade_id} on {d}")
+    logging.info("Trade log validation completed.")
+
 # Load environment variables from .env file in repository root, if present
 env_path = Path(__file__).parent.parent / '.env'
 if env_path.exists():
@@ -33,7 +97,7 @@ def compute_sma(prices: Sequence[float]) -> Optional[float]:
     return sum(prices) / len(prices)
 
 
-# ─── CONFIG ─────────────────────────────────────────────────────────────────────
+# --- CONFIG ---
 # Load credentials and settings from environment (support legacy .env keys)
 # API key/secret: allow APCA_* or (legacy) APCA_*_ID, APCA_*_KEY
 API_KEY = os.getenv("APCA_API_KEY") or os.getenv("APCA_API_KEY_ID")
@@ -51,6 +115,10 @@ BASELINE_FILE = BASE_DIR / os.getenv("BASELINE_FILE", "baselines.json")
 TRADE_LOG_FILE = BASE_DIR / os.getenv("TRADE_LOG_FILE", "trade_log.csv")
 LOG_FILE_PATH = BASE_DIR / os.getenv("LOG_FILE_PATH", "sentinel.log")
 PRICE_HISTORY_FILE = BASE_DIR / os.getenv("PRICE_HISTORY_FILE", "price_history.csv")
+# File for persisting SMA price windows state across restarts
+SMA_STATE_FILE = BASE_DIR / os.getenv("SMA_STATE_FILE", "sma_state.json")
+# File for persisting purchase dates to prevent same-day sells across restarts
+PURCHASE_DATES_FILE = BASE_DIR / os.getenv("PURCHASE_DATES_FILE", "purchase_dates.json")
 
 # Trading triggers
 BUY_TRIGGER_A = float(os.getenv("BUY_TRIGGER_A", 0.995))
@@ -126,8 +194,13 @@ logger.addHandler(stream_handler)
 api = None
 if __name__ == "__main__":
     api = REST(API_KEY, API_SECRET, BASE_URL)
+    # Migrate old trade log and load open positions
+    migrate_trade_log()
+    open_positions = load_positions()
+    validate_trades()
 
-# ─── EXPONENTIAL BACKOFF ────────────────────────────────────────────────────────
+
+# --- EXPONENTIAL BACKOFF ---
 def retry_api_call(func, *args, retries=5, base_delay=5, **kwargs):
     global error_streak
     for i in range(retries):
@@ -142,7 +215,7 @@ def retry_api_call(func, *args, retries=5, base_delay=5, **kwargs):
                 return None
             # increment error streak
             error_streak += 1
-            logging.exception(f"Error calling {func.__name__} — full traceback")
+            logging.exception(f"Error calling {func.__name__} -- full traceback")
             # Circuit breaker: cooldown on too many consecutive errors
             if error_streak >= CIRCUIT_BREAKER_THRESHOLD:
                 logging.error(f"Circuit breaker tripped after {error_streak} errors. Cooling down for {CIRCUIT_BREAKER_COOLDOWN}s.")
@@ -156,7 +229,7 @@ def retry_api_call(func, *args, retries=5, base_delay=5, **kwargs):
             time.sleep(wait)
     raise RuntimeError(f"API call failed after {retries} retries: {func.__name__}")
 
-# ─── BASELINE MANAGEMENT ───────────────────────────────────────────────────────
+# --- BASELINE MANAGEMENT ---
 def load_baselines():
     if not os.path.exists(BASELINE_FILE):
         return {}
@@ -195,47 +268,113 @@ def record_price_history(symbol, price, baseline):
 
 baselines = load_baselines()
 
-# ─── SMA WINDOW PERSISTENCE ────────────────────────────────────────────────
+# --- SMA WINDOW PERSISTENCE ---
+
+
 def load_price_windows():
-    """Load SMA warmup windows from price_history.csv for the current trading day."""
+    """Load SMA warmup windows from price history and state file for the current trading day."""
     windows = defaultdict(lambda: deque(maxlen=SMA_PERIOD))
+    # Reconstruct from price history if available
     try:
         if PRICE_HISTORY_FILE.exists():
             with open(PRICE_HISTORY_FILE, newline="") as f:
                 reader = csv.reader(f)
-                _ = next(reader, None)
+                next(reader, None)
                 for row in reader:
-                    # row: [timestamp, symbol, price, baseline]
                     ts_str, sym, price_str, *_ = row
                     try:
                         dt_ts = datetime.fromisoformat(ts_str)
                     except ValueError:
                         continue
-                    # Convert to ET and filter by today's date
                     dt_ts = dt_ts.astimezone(ET)
                     if dt_ts.date() == datetime.now(ET).date():
                         windows[sym].append(float(price_str))
+            # Return history-based windows if any data loaded
+            if windows:
+                infos = []
+                for s, w in windows.items():
+                    sma_val = compute_sma(w)
+                    if sma_val is not None:
+                        infos.append(f"{s}: {len(w)}/{SMA_PERIOD} (SMA={sma_val:.2f})")
+                    else:
+                        infos.append(f"{s}: {len(w)}/{SMA_PERIOD}")
+                logging.info(f"Preloaded SMA windows (from history): {', '.join(infos)}")
+                return windows
     except Exception as e:
-        logging.error(f"Failed to load price windows: {e}")
-    # Log preloaded window sizes
-    # Log preloaded window sizes and SMA if complete
-    infos = []
-    for s, w in windows.items():
-        sma_val = compute_sma(w)
-        if sma_val is not None:
-            infos.append(f"{s}: {len(w)}/{SMA_PERIOD} (SMA={sma_val:.2f})")
-        else:
-            infos.append(f"{s}: {len(w)}/{SMA_PERIOD}")
-    if infos:
-        logging.info(f"Preloaded SMA windows: {', '.join(infos)}")
+        logging.error(f"Failed to load price windows from history: {e}")
+    # Fallback: load saved SMA state
+    try:
+        if SMA_STATE_FILE.exists():
+            with open(SMA_STATE_FILE) as f:
+                data = json.load(f)
+            if data.get("date") == datetime.now(ET).date().isoformat():
+                state_windows = defaultdict(lambda: deque(maxlen=SMA_PERIOD))
+                for s, lst in data.get("windows", {}).items():
+                    for p in lst:
+                        state_windows[s].append(p)
+                logging.info(f"Loaded SMA state (fallback) from {SMA_STATE_FILE}")
+                return state_windows
+            else:
+                logging.info(f"Ignored stale SMA state file dated {data.get('date')}")
+    except Exception as e:
+        logging.error(f"Failed to load SMA state: {e}")
+    # Return empty windows if no data found
     return windows
+def save_sma_state(windows):
+    """Save SMA warmup windows to state file."""
+    try:
+        data = {
+            "date": datetime.now(ET).date().isoformat(),
+            "windows": {s: list(w) for s, w in windows.items()},
+        }
+        with open(SMA_STATE_FILE, "w") as f:
+            json.dump(data, f)
+        logging.info(f"Saved SMA state to {SMA_STATE_FILE}")
+    except Exception as e:
+        logging.error(f"Failed to save SMA state: {e}")
+
+# --- PURCHASE DATES PERSISTENCE ---
+
+def load_purchase_dates():
+    """Load purchase dates mapping for today's trades from state file."""
+    pd_map = {}
+    try:
+        with open(PURCHASE_DATES_FILE) as f:
+            data = json.load(f)
+        file_date = data.get("date")
+        today_str = datetime.now(ET).date().isoformat()
+        if file_date == today_str:
+            raw = data.get("purchase_dates", {})
+            pd_map = {sym: date.fromisoformat(dstr) for sym, dstr in raw.items()}
+            logging.info(f"Loaded purchase dates for today: {list(pd_map.keys())}")
+        else:
+            logging.info(f"Ignored stale purchase dates file dated {file_date}")
+    except FileNotFoundError:
+        logging.info(f"No purchase dates file found at {PURCHASE_DATES_FILE}, starting fresh")
+    except Exception as e:
+        logging.error(f"Failed to load purchase dates: {e}")
+    return pd_map
+
+def save_purchase_dates(purchase_dates):
+    """Save purchase dates mapping to state file."""
+    try:
+        data = {
+            "date": datetime.now(ET).date().isoformat(),
+            "purchase_dates": {sym: d.isoformat() for sym, d in purchase_dates.items()},
+        }
+        with open(PURCHASE_DATES_FILE, "w") as f:
+            json.dump(data, f)
+        logging.info(f"Saved purchase dates to {PURCHASE_DATES_FILE}")
+    except Exception as e:
+        logging.error(f"Failed to save purchase dates: {e}")
+
 
 
 
 # Sliding windows for SMA trend filter (preload from price history to skip warmup if restarted)
 price_windows = load_price_windows()
 
-# ─── POSITION & PRICE HELPERS ──────────────────────────────────────────────────
+# --- POSITION & PRICE HELPERS ---
 def get_position_info(symbol):
     p = retry_api_call(api.get_position, symbol)
     if not p:
@@ -260,8 +399,9 @@ def calculate_atr(symbol):
         prev_close = bar.c
     return sum(trs)/len(trs) if trs else None
 
-def log_trade(action, symbol, qty, price):
-    fieldnames = ["timestamp", "action", "symbol", "quantity", "price"]
+def log_trade(action: str, symbol: str, quantity: float, price: float, trade_id: str = "", entry_price: float = None, profit: float = None):
+    """Log a trade to CSV, including trade_id, entry_price, and profit."""
+    fieldnames = ["timestamp", "action", "trade_id", "symbol", "quantity", "entry_price", "price", "profit"]
     file_exists = os.path.isfile(TRADE_LOG_FILE)
     with open(TRADE_LOG_FILE, mode="a", newline="") as file:
         writer = csv.DictWriter(file, fieldnames=fieldnames)
@@ -270,17 +410,61 @@ def log_trade(action, symbol, qty, price):
         writer.writerow({
             "timestamp": datetime.now(PT).isoformat(),
             "action": action,
+            "trade_id": trade_id,
             "symbol": symbol,
-            "quantity": qty,
-            "price": price
+            "quantity": quantity,
+            "entry_price": entry_price if entry_price is not None else "",
+            "price": price,
+            "profit": profit if profit is not None else ""
         })
 
 
-# ─── GRACEFUL SHUTDOWN HANDLER ──────────────────────────────────────────
+
+def execute_buy(symbol: str, quantity: float, price: float, open_positions: dict) -> str:
+    """Perform bookkeeping for a buy: generate trade_id, persist position, and log the trade."""
+    trade_id = uuid.uuid4().hex
+    open_positions[trade_id] = {
+        "symbol": symbol,
+        "quantity": quantity,
+        "entry_price": price,
+        "open_time": datetime.now(PT)
+    }
+    save_positions(open_positions)
+    log_trade("buy", symbol, quantity, price, trade_id=trade_id, entry_price=price)
+    return trade_id
+
+
+def execute_sell(symbol: str, quantity: float, price: float, open_positions: dict) -> tuple[str, float] | tuple[None, None]:
+    """Perform bookkeeping for a sell: compute profit, persist changes, and log the trade."""
+    for trade_id, pos in list(open_positions.items()):
+        if pos.get("symbol") == symbol:
+            entry_price = pos.get("entry_price", 0)
+            profit = (price - entry_price) * quantity
+            del open_positions[trade_id]
+            save_positions(open_positions)
+            log_trade("sell", symbol, quantity, price, trade_id=trade_id, profit=profit)
+            return trade_id, profit
+    logging.warning(f"Validation: sell without matching buy for symbol {symbol}")
+    return None, None
+
+
+
+# --- GRACEFUL SHUTDOWN HANDLER ---
 def graceful_shutdown(signum, frame):
     logging.info(f"Received signal {signum}, shutting down.")
+    # Persist SMA state before exit
+    try:
+        save_sma_state(price_windows)
+    except Exception:
+        logging.exception("Error saving SMA state on shutdown")
+    # Persist purchase dates before exit
+    try:
+        save_purchase_dates(purchase_dates)
+    except Exception:
+        logging.exception("Error saving purchase dates on shutdown")
     try:
         if summary and not sent_closing_email:
+            validate_trades()
             send_email("Early Exit Market Summary", "\n".join(summary))
     except Exception:
         logging.exception("Error sending summary on shutdown")
@@ -303,7 +487,7 @@ logging.info("Market Sentinel bot started.")
 summary = []
 sent_closing_email = False
 last_trading_date = None
-purchase_dates = {}
+purchase_dates = load_purchase_dates()
 
 while api is not None:
     try:
@@ -364,7 +548,7 @@ while api is not None:
                 if reset_req:
                     baselines[sym] = {"price": price, "ts": now}
                     save_baselines(baselines)
-                    logging.info(f"[{bot_name}][{sym}] Reset baseline → ${price:.2f}")
+                    logging.info(f"[{bot_name}][{sym}] Reset baseline -> ${price:.2f}")
 
                 base_price = baselines[sym]["price"]
                 record_price_history(sym, price, base_price)
@@ -389,8 +573,9 @@ while api is not None:
                 if qty == 0 and price <= buy_price and trend_ok and not is_lunch_time():
                     qty_to_buy = round((cash * RISK_PCT) / price, 6)
                     retry_api_call(api.submit_order, symbol=sym, qty=qty_to_buy, side="buy", type="market", time_in_force="day")
-                    log_trade("buy", sym, qty_to_buy, price)
+                    trade_id = execute_buy(sym, qty_to_buy, price, open_positions)
                     purchase_dates[sym] = now.date()
+                    save_purchase_dates(purchase_dates)
                     summary.append(f"[{bot_name}] BUY {qty_to_buy:.6f} of {sym} @ ${price:.2f}")
                 elif qty > 0:
                     if purchase_dates.get(sym) == now.date():
@@ -398,12 +583,18 @@ while api is not None:
                         continue
                     if price >= sell_price:
                         retry_api_call(api.submit_order, symbol=sym, qty=qty, side="sell", type="market", time_in_force="day")
-                        log_trade("sell", sym, qty, price)
-                        summary.append(f"[{bot_name}] SELL (target) {qty:.6f} of {sym} @ ${price:.2f}")
+                        trade_id, profit = execute_sell(sym, qty, price, open_positions)
+                        if not trade_id:
+                            logging.warning(f"[{bot_name}] No open position to sell for {sym}, skipping.")
+                        else:
+                            summary.append(f"[{bot_name}] SELL (target) {qty:.6f} of {sym} @ ${price:.2f}")
                     elif price <= stop_price:
                         retry_api_call(api.submit_order, symbol=sym, qty=qty, side="sell", type="market", time_in_force="day")
-                        log_trade("sell", sym, qty, price)
-                        summary.append(f"[{bot_name}] SELL (stop) {qty:.6f} of {sym} @ ${price:.2f}")
+                        trade_id, profit = execute_sell(sym, qty, price, open_positions)
+                        if not trade_id:
+                            logging.warning(f"[{bot_name}] No open position to sell for {sym}, skipping.")
+                        else:
+                            summary.append(f"[{bot_name}] SELL (stop) {qty:.6f} of {sym} @ ${price:.2f}")
 
         if is_market_close() and not sent_closing_email:
             equity = float(retry_api_call(api.get_account).equity)
@@ -412,10 +603,11 @@ while api is not None:
             summary.append("")
             summary.append(f"EOD Equity: ${equity:.2f}")
             summary.append(f"Unrealized P/L: ${unrealized:.2f}")
+            validate_trades()
             send_email("Daily Market Summary", "\n".join(summary or ["No trades today."]))
             sent_closing_email = True
 
         time.sleep(60)
     except Exception:
-        logging.exception("Main loop error — full traceback")
+        logging.exception("Main loop error -- full traceback")
         time.sleep(60)
