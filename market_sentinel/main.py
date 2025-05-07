@@ -104,8 +104,7 @@ def compute_sma(prices: Sequence[float]) -> Optional[float]:
 API_KEY = os.getenv("APCA_API_KEY") or os.getenv("APCA_API_KEY_ID")
 API_SECRET = os.getenv("APCA_API_SECRET") or os.getenv("APCA_API_SECRET_KEY")
 # Base URL: allow APCA_BASE_URL or (legacy) ALPACA_BASE_URL, default to production
-# Base URL: prefer env override, default to paper trading to avoid PDT blocks
-BASE_URL = os.getenv("APCA_BASE_URL") or os.getenv("ALPACA_BASE_URL") or "https://paper-api.alpaca.markets"
+BASE_URL = os.getenv("APCA_BASE_URL") or os.getenv("ALPACA_BASE_URL") or "https://api.alpaca.markets"
 
 # Directory for local files
 BASE_DIR = Path(__file__).parent
