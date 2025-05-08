@@ -1,0 +1,13 @@
+# Ignore runtime state files for Market Sentinel
+/market_sentinel/trade_log.csv
+/market_sentinel/price_history.csv
+/market_sentinel/sma_state.json
+/market_sentinel/purchase_dates.json
+/market_sentinel/sentinel.log
+
+# Ignore Python cache and compiled files
+__pycache__/
+*.pyc
+
+# Ignore virtual environment and environment files
+.env

@@ -67,3 +67,31 @@ export APCA_API_SECRET=your_secret
 # ... set other variables as needed
 python3 "Market Sentinel/main.py"
 ```
+
+### Persistence
+
+Market Sentinel persists state across restarts using two JSON files:
+
+- **SMA_STATE_FILE** (default: `sma_state.json`): Stores sliding windows for SMA calculations.
+  You can override the file path via the `SMA_STATE_FILE` environment variable.
+- **PURCHASE_DATES_FILE** (default: `purchase_dates.json`): Stores purchase dates mapping to enforce one sell per purchase per day.
+  You can override the file path via the `PURCHASE_DATES_FILE` environment variable.
+
+#### PURCHASE_DATES_FILE JSON schema
+
+```json
+{
+  "date": "YYYY-MM-DD",
+  "purchase_dates": {
+    "SYMBOL1": "YYYY-MM-DD",
+    "SYMBOL2": "YYYY-MM-DD"
+  }
+}
+```
+
+On startup, the bot loads the purchase dates file and:
+- If the `date` matches today's date (in US/Eastern timezone), loads the `purchase_dates` mapping.
+- Otherwise, ignores stale data and starts with an empty mapping.
+
+During operation, purchase dates are flushed to disk immediately after each buy to ensure persistence even if the bot exits unexpectedly.
+

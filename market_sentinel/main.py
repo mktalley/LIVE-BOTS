@@ -103,7 +103,7 @@ def compute_sma(prices: Sequence[float]) -> Optional[float]:
 # API key/secret: allow APCA_* or (legacy) APCA_*_ID, APCA_*_KEY
 API_KEY = os.getenv("APCA_API_KEY") or os.getenv("APCA_API_KEY_ID")
 API_SECRET = os.getenv("APCA_API_SECRET") or os.getenv("APCA_API_SECRET_KEY")
-# Base URL: allow APCA_BASE_URL or (legacy) ALPACA_BASE_URL, default to production
+# Base URL: use APCA_BASE_URL if set, otherwise default to Alpaca paper trading endpoint
 BASE_URL = os.getenv("APCA_BASE_URL") or os.getenv("ALPACA_BASE_URL") or "https://api.alpaca.markets"
 
 # Directory for local files
@@ -198,6 +198,27 @@ if __name__ == "__main__":
     # Migrate old trade log and load open positions
     migrate_trade_log()
     open_positions = load_positions()
+    # Bootstrap existing Alpaca positions not yet in our JSON
+    try:
+        for p in retry_api_call(api.list_positions) or []:
+            sym = p.symbol
+            qty = float(p.qty)
+            entry = float(p.avg_entry_price)
+            # Only bootstrap new positive positions
+            if qty > 0 and not any(pos["symbol"] == sym for pos in open_positions.values()):
+                tid = uuid.uuid4().hex
+                open_positions[tid] = {
+                    "symbol": sym,
+                    "quantity": qty,
+                    "entry_price": entry,
+                    "open_time": datetime.now(PT),
+                }
+                save_positions(open_positions)
+                log_trade("buy", sym, qty, entry, trade_id=tid, entry_price=entry)
+                logging.info(f"Bootstrapped position for {sym}: qty={qty}, entry_price={entry}")
+    except Exception:
+        logging.exception("Error bootstrapping Alpaca positions")
+
     validate_trades()
 
 
@@ -211,6 +232,11 @@ def retry_api_call(func, *args, retries=5, base_delay=5, **kwargs):
             error_streak = 0
             return result
         except Exception as e:
+            # Handle pattern day trading protection: skip without retry
+            msg = str(e).lower()
+            if "pattern day trading protection" in msg:
+                logging.error(f"PDT protection from Alpaca on {func.__name__}: {e}. Skipping order.")
+                return None
             # Return None for missing positions or symbols
             if any(msg in str(e) for msg in ("position does not exist", "symbol not found")):
                 return None
@@ -337,6 +363,44 @@ def save_sma_state(windows):
 # --- PURCHASE DATES PERSISTENCE ---
 
 def load_purchase_dates():
+    """Load purchase dates mapping for today's trades from state file and trade log."""
+    pd_map = {}
+    today = datetime.now(ET).date()
+    # Load from persisted state
+    try:
+        with open(PURCHASE_DATES_FILE) as f:
+            data = json.load(f)
+        file_date = data.get("date")
+        if file_date == today.isoformat():
+            raw = data.get("purchase_dates", {})
+            pd_map = {sym: date.fromisoformat(dstr) for sym, dstr in raw.items()}
+            logging.info(f"Loaded purchase dates for today from state: {list(pd_map.keys())}")
+        else:
+            logging.info(f"Ignored stale purchase dates file dated {file_date}")
+    except FileNotFoundError:
+        logging.info(f"No purchase dates file found at {PURCHASE_DATES_FILE}, starting fresh")
+    except Exception as e:
+        logging.error(f"Failed to load purchase dates: {e}")
+    # Augment from trade log: ensure buys in trade_log.csv are captured
+    try:
+        if TRADE_LOG_FILE.exists():
+            with open(TRADE_LOG_FILE) as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    if row.get('action') == 'buy':
+                        ts = row.get('timestamp')
+                        try:
+                            dt = datetime.fromisoformat(ts)
+                        except Exception:
+                            continue
+                        if dt.date() == today:
+                            sym = row.get('symbol')
+                            pd_map[sym] = today
+            if pd_map:
+                logging.info(f"Augmented purchase dates from trade log: {list(pd_map.keys())}")
+    except Exception as e:
+        logging.error(f"Failed to scan trade log for purchase dates: {e}")
+    return pd_map
     """Load purchase dates mapping for today's trades from state file."""
     pd_map = {}
     try:
@@ -551,7 +615,11 @@ while api is not None:
                     save_baselines(baselines)
                     logging.info(f"[{bot_name}][{sym}] Reset baseline -> ${price:.2f}")
 
-                base_price = baselines[sym]["price"]
+                                # use actual entry price when holding a position
+                if qty > 0:
+                    base_price = avg_entry
+                else:
+                    base_price = baselines[sym]["price"]
                 record_price_history(sym, price, base_price)
                 # SMA trend filter
                 price_windows[sym].append(price)
